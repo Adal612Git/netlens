@@ -18,6 +18,12 @@ def _ensure_core_on_path() -> None:
 _ensure_core_on_path()
 
 from core import normalize_url, resolve_ip  # noqa: E402
+from enrich import (  # noqa: E402
+    get_whois,
+    get_geoip,
+    get_tls_info,
+    get_dns_records,
+)
 
 
 logger = logging.getLogger("netlens")
@@ -46,6 +52,40 @@ def run_resolve(input_file: Optional[str], stdin: TextIO, stdout: TextIO) -> int
             ip = resolve_ip(host)
             ts = datetime.now(timezone.utc).isoformat()
             writer.writerow([name, ip, port, ts])
+
+            # Enriquecimiento: imprimir en STDERR como JSON
+            import json
+            from threading import Thread
+            from queue import Queue, Empty
+
+            def _run_with_timeout(func, *args, timeout: float = 3.0, **kwargs):
+                q: "Queue[object]" = Queue(maxsize=1)
+
+                def runner():
+                    try:
+                        q.put(func(*args, **kwargs))
+                    except Exception as e:  # noqa: BLE001
+                        q.put({"error": str(e)})
+
+                t = Thread(target=runner, daemon=True)
+                t.start()
+                try:
+                    return q.get(timeout=timeout)
+                except Empty:
+                    return {"error": "timeout"}
+
+            whois_info = _run_with_timeout(get_whois, host, timeout=1.0)
+            geoip_info = _run_with_timeout(get_geoip, ip, timeout=1.0)
+            tls_info = _run_with_timeout(get_tls_info, host, port=port, timeout=2.0)
+            dns_info = _run_with_timeout(get_dns_records, host, timeout=1.0)
+
+            enriched = {
+                "whois": whois_info,
+                "geoip": geoip_info,
+                "tls": tls_info,
+                "dns": dns_info,
+            }
+            print(json.dumps(enriched, ensure_ascii=False), file=sys.stderr)
         except Exception as exc:  # noqa: BLE001
             logger.error("Error resolviendo '%s' (%s): %s", name, url, exc)
 
