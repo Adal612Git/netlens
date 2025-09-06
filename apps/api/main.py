@@ -1,7 +1,7 @@
-import json
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any
 
 
 def _ensure_core_on_path() -> None:
@@ -15,36 +15,45 @@ _ensure_core_on_path()
 
 from core import normalize_url, resolve_ip  # noqa: E402
 
-try:
-    from flask import Flask, jsonify, request
-except Exception:  # noqa: BLE001
-    # Lazy import failure handler to avoid breaking environments without Flask
-    Flask = None  # type: ignore
-    jsonify = None  # type: ignore
-    request = None  # type: ignore
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel, Field
 
 
-def create_app():
-    if Flask is None:
-        raise RuntimeError("Flask is not installed in this environment")
+app = FastAPI(title="NetLens API")
 
-    app = Flask(__name__)
 
-    @app.post("/resolve")
-    def resolve():  # type: ignore[override]
-        data: Dict[str, Any] = request.get_json(silent=True) or {}
-        name = str(data.get("name", "")).strip()
-        url = str(data.get("url", "")).strip()
-        if not name or not url:
-            return jsonify({"error": "name and url are required"}), 400
-        host, port = normalize_url(url)
+class ResolveRequest(BaseModel):
+    name: str = Field(..., min_length=1)
+    url: str = Field(..., min_length=1)
+
+
+class ResolveResponse(BaseModel):
+    name: str
+    ip: str
+    port: int
+    timestamp: str
+
+
+@app.get("/healthz")
+def healthz() -> dict[str, str]:
+    return {"status": "ok"}
+
+
+@app.post("/resolve", response_model=ResolveResponse)
+def resolve(req: ResolveRequest) -> Any:
+    try:
+        host, port = normalize_url(req.url)
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=400, detail=f"invalid url: {exc}") from exc
+
+    if not host:
+        raise HTTPException(status_code=400, detail="invalid url: missing host")
+
+    try:
         ip = resolve_ip(host)
-        return jsonify({"name": name, "ip": ip, "port": port})
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-    return app
-
-
-if __name__ == "__main__":
-    app = create_app()
-    app.run(host="0.0.0.0", port=5000, debug=True)
+    ts = datetime.now(timezone.utc).isoformat()
+    return {"name": req.name, "ip": ip, "port": port, "timestamp": ts}
 
