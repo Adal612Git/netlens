@@ -1,4 +1,5 @@
 import sys
+import logging
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -20,12 +21,20 @@ from enrich import (  # noqa: E402
     get_tls_info,
     get_dns_records,
 )
+try:  # noqa: E402
+    from db import get_session, Target, Probe, Result  # type: ignore
+    _DB_AVAILABLE = True
+except Exception as _db_import_exc:  # noqa: BLE001
+    get_session = None  # type: ignore[assignment]
+    Target = Probe = Result = None  # type: ignore[assignment]
+    _DB_AVAILABLE = False
 
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
 
 app = FastAPI(title="NetLens API")
+logger = logging.getLogger("netlens.api")
 
 
 class ResolveRequest(BaseModel):
@@ -90,7 +99,7 @@ def resolve(req: ResolveRequest) -> Any:
     dns_info = _run_with_timeout(get_dns_records, host, timeout=1.0)
 
     ts = datetime.now(timezone.utc).isoformat()
-    return {
+    resp = {
         "name": req.name,
         "ip": ip,
         "port": port,
@@ -100,3 +109,46 @@ def resolve(req: ResolveRequest) -> Any:
         "tls": tls_info,
         "dns": dns_info,
     }
+
+    # Persist best-effort; log and continue on failure
+    if _DB_AVAILABLE and get_session and Target and Probe and Result:  # type: ignore[truthy-bool]
+        try:
+            session = get_session()  # type: ignore[misc]
+            try:
+                target = (
+                    session.query(Target)  # type: ignore[union-attr]
+                    .filter(Target.name == req.name, Target.url == req.url)  # type: ignore[union-attr]
+                    .first()
+                )
+                if target is None:
+                    target = Target(name=req.name, url=req.url)  # type: ignore[call-arg]
+                    session.add(target)
+                    session.flush()
+
+                probe = Probe(target_id=target.id)  # type: ignore[call-arg]
+                session.add(probe)
+                session.flush()
+
+                result = Result(  # type: ignore[call-arg]
+                    probe_id=probe.id,
+                    ip=ip,
+                    port=port,
+                    whois=whois_info,
+                    geoip=geoip_info,
+                    tls=tls_info,
+                    dns=dns_info,
+                )
+                session.add(result)
+                session.commit()
+            finally:
+                try:
+                    session.close()
+                except Exception:  # noqa: BLE001
+                    pass
+        except Exception as db_exc:  # noqa: BLE001
+            logger.error("DB persist failed: %s", db_exc)
+    else:
+        if not _DB_AVAILABLE:
+            logger.debug("DB not available; skipping persistence")
+
+    return resp
